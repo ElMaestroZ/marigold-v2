@@ -9,6 +9,30 @@ os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 import random
 import numpy as np
 import bitsandbytes as bnb
+import logging
+from pathlib import Path
+from typing import List
+
+from omegaconf import OmegaConf
+
+# Register custom OmegaConf resolvers before importing marigold modules or loading configs
+if not OmegaConf.has_resolver("mul"):
+    OmegaConf.register_new_resolver("mul", lambda a, b: int(float(a) * float(b)))
+
+if not OmegaConf.has_resolver("scale_list"):
+    OmegaConf.register_new_resolver(
+        "scale_list",
+        lambda scale, *pts: [int(float(scale) * float(p)) for p in pts],
+    )
+
+import torch
+import torch.nn as nn
+from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
+from torch.optim import Adam, AdamW
+from torch.optim.lr_scheduler import LinearLR, SequentialLR, LambdaLR
+
+import transformers
+import diffusers
 
 from accelerate import Accelerator
 from accelerate.utils import (
@@ -16,20 +40,8 @@ from accelerate.utils import (
     ProjectConfiguration,
     set_seed,
 )
-import logging
-import torch
-import torch.nn as nn
-from pathlib import Path
-from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
-from torch.optim import Adam, AdamW
-from torch.optim.lr_scheduler import LinearLR, SequentialLR, LambdaLR
-
-from typing import List
-import transformers
-import diffusers
 
 from marigoldv2.trainer import get_trainer_cls
-
 from marigoldv2.core.builder import (
     build_transforms,
     build_dataset,
@@ -569,9 +581,30 @@ def main():
     accelerator.register_save_state_pre_hook(save_hook)
     accelerator.register_load_state_pre_hook(load_hook)
 
-    # Load checkpoint if specified
+    # -------------------- Load Checkpoint / Resume --------------------
+    resume_checkpoint = in_args.get("resume_run", None)
     checkpoint_path = cfg.paths.get("checkpoint", None)
-    if checkpoint_path is not None:
+
+    if resume_checkpoint is not None:
+        if accelerator.is_main_process:
+            logging.info(f"Resuming run from checkpoint: {resume_checkpoint}")
+        if os.path.isdir(resume_checkpoint):
+            try:
+                # Restores weights via load_hook, plus optimizer, scheduler, and step count
+                accelerator.load_state(resume_checkpoint)
+                if accelerator.is_main_process:
+                    logging.info(
+                        f"Successfully restored accelerator state from: {resume_checkpoint}"
+                    )
+            except Exception as e:
+                if accelerator.is_main_process:
+                    logging.warning(
+                        f"accelerator.load_state failed ({e}), falling back to loading trainables hook."
+                    )
+                load_hook([], resume_checkpoint)
+        else:
+            load_hook([], resume_checkpoint)
+    elif checkpoint_path is not None:
         if accelerator.is_main_process:
             logging.info(f"Loading checkpoint from: {checkpoint_path}")
         load_hook([], checkpoint_path)

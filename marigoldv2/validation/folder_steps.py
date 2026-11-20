@@ -157,6 +157,11 @@ def _normal_rgb(normals: np.ndarray) -> np.ndarray:
 def _albedo_rgb(albedo: np.ndarray) -> np.ndarray:
     return (albedo.transpose(1, 2, 0).clip(0.0, 1.0) * 255.0).round().astype(np.uint8)
 
+def _shading_rgb(shading: np.ndarray) -> np.ndarray:
+    if shading.ndim == 3 and shading.shape[0] == 3:
+        shading = shading.transpose(1, 2, 0)
+    return (np.clip(shading, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+
 
 def _linear_to_srgb(value: torch.Tensor) -> torch.Tensor:
     """Apply the Marigold V1 gamma-2.2 linear-RGB to sRGB conversion."""
@@ -226,6 +231,29 @@ class FolderRGBAlbedoPrediction:
         _set_output(batch, self.output_key, albedo.to(decoded.dtype))
         return batch
 
+@register("network_graph")
+class FolderRGBShadingPrediction:
+    def __init__(self, kwargs=None):
+        kwargs = kwargs or {}
+        self.input_key = str(kwargs.get("input_key", "out/pixel_pred"))
+        self.output_key = str(kwargs.get("output_key", "out/shading_pred"))
+        self.output_color_space = str(kwargs.get("output_color_space", "linear"))
+        if self.output_color_space not in {"linear", "srgb"}:
+            raise ValueError(
+                "FolderRGBShadingPrediction output_color_space must be 'linear' or 'srgb'"
+            )
+
+    def __call__(self, batch):
+        decoded = get_nested_key(batch, self.input_key)
+        if decoded.ndim != 4 or decoded.shape[1] != 3:
+            raise ValueError(
+                f"FolderRGBShadingPrediction expects [B,3,H,W], got {tuple(decoded.shape)}"
+            )
+        shading = (decoded.float() + 1.0) * 0.5
+        if self.output_color_space == "srgb":
+            shading = _linear_to_srgb(shading)
+        _set_output(batch, self.output_key, shading.to(decoded.dtype))
+        return batch
 
 @register("validation_steps")
 class SaveFolderPredictionNpy:
@@ -320,4 +348,20 @@ class VisualizeFolderAlbedo(_FolderVisualization):
                 batch, self.folder_name, self.base_dir, index, ".png"
             )
             cv2.imwrite(str(path), cv2.cvtColor(_albedo_rgb(albedo), cv2.COLOR_RGB2BGR))
+        return batch
+
+@register("validation_steps")
+class VisualizeFolderShading(_FolderVisualization):
+    def __call__(self, batch):
+        for index, shading in self._arrays(batch):
+            if shading is None:
+                continue
+            path = _prediction_path(
+                batch, self.folder_name, self.base_dir, index, ".png"
+            )
+            image = _shading_rgb(shading)
+            cv2.imwrite(
+                str(path),
+                image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
+            )
         return batch

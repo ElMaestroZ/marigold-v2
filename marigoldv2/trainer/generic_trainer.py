@@ -1,15 +1,18 @@
+import os
+import re
+import logging
+from time import time
+from collections import defaultdict
+from PIL import Image
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-
-import os
-from time import time
 from torch.utils.data import DataLoader
-from PIL import Image
 from accelerate import DistributedType
+
 from marigoldv2.core.registry import REGISTRY
 from marigoldv2.validation.validate import validate_dataloader
-import logging
 from marigoldv2.util.logging_util import eval_dict_to_text
 from marigoldv2.validation.metric import MetricTracker
 from marigoldv2.validation import metric
@@ -91,16 +94,13 @@ class GenericTrainer:
         """Return a TensorBoard SummaryWriter (or compatible object) if available."""
         try:
             tb_obj = self.accelerator.get_tracker("tensorboard", unwrap=True)
-            # In newer accelerate versions this is already a SummaryWriter.
             if hasattr(tb_obj, "add_image"):
                 return tb_obj
-            # In older wrappers, writer is nested.
             if hasattr(tb_obj, "writer") and hasattr(tb_obj.writer, "add_image"):
                 return tb_obj.writer
         except Exception:
             pass
 
-        # Fallback path for tracker wrapper variations.
         for tracker in getattr(self.accelerator, "trackers", []):
             writer = getattr(tracker, "writer", None)
             if writer is not None and hasattr(writer, "add_image"):
@@ -126,7 +126,6 @@ class GenericTrainer:
             try:
                 param_norm = float(p.grad.detach().norm(norm_type).cpu().item())
             except Exception:
-                # Fallback if grad is on CPU or other device
                 param_norm = float(p.grad.detach().norm(norm_type).item())
             total += param_norm**norm_type
         if total == 0.0:
@@ -209,8 +208,6 @@ class GenericTrainer:
                 selected_common_ids = ordered_common_ids
 
         num_logged = 0
-        from collections import defaultdict
-
         wandb_images_by_dataset = defaultdict(list)
         for folder_name, entries in saved_output_paths.items():
             if not entries:
@@ -258,7 +255,6 @@ class GenericTrainer:
         if num_logged > 0 and hasattr(writer, "flush"):
             writer.flush()
         if wandb_run is not None and wandb_images_by_dataset:
-            # log per-dataset image lists so W&B groups don't mix datasets
             wandb_run.log(
                 {k: v for k, v in wandb_images_by_dataset.items()},
                 step=self.global_step,
@@ -273,7 +269,7 @@ class GenericTrainer:
         val_period = self.cfg.optimization.val_period
         val_points = self.cfg.optimization.val_points
         out_dir_run = self.cfg.out_dir_run
-        # Initialize max gradient norm from config once per run (fallback 1.0)
+
         opt_cfg = getattr(self.cfg, "optimization", None)
         if opt_cfg is not None:
             if hasattr(opt_cfg, "get"):
@@ -282,6 +278,7 @@ class GenericTrainer:
                 self.max_grad_norm = float(getattr(opt_cfg, "max_grad_norm", 1.0))
         else:
             self.max_grad_norm = 1.0
+
         console_log_every = int(
             self.cfg.get("logging", {}).get(
                 "console_log_every",
@@ -301,7 +298,7 @@ class GenericTrainer:
         self.val_metrics = MetricTracker(*self.metric_names)
         val_cfg = self.cfg.validation
         self.main_val_metric = val_cfg.main_val_metric
-        self.main_val_metric_goal = val_cfg.main_val_metric_goal  # minimize | maximize
+        self.main_val_metric_goal = val_cfg.main_val_metric_goal
         self.strip_log_from_metric_names_for_logging = bool(
             getattr(val_cfg, "strip_log_from_metric_names_for_logging", False)
         )
@@ -315,22 +312,74 @@ class GenericTrainer:
         else:
             self.best_val_score = float("-inf")
 
-        self.global_step = 0
+        # Restore historic best score if resuming
+        best_step_info = os.path.join(out_dir_run, "checkpoint", "checkpoint-best", "step_info.txt")
+        if os.path.exists(best_step_info):
+            try:
+                with open(best_step_info, "r") as f:
+                    for line in f:
+                        if self.main_val_metric in line:
+                            match = re.search(r"[-+]?\d*\.\d+|\d+", line.split(":")[-1])
+                            if match:
+                                self.best_val_score = float(match.group(0))
+                                if accelerator.is_main_process:
+                                    logging.info(
+                                        f"Restored historic best validation score for '{self.main_val_metric}': {self.best_val_score}"
+                                    )
+                                break
+            except Exception as e:
+                logging.warning(f"Could not restore best_val_score from checkpoint-best: {e}")
+
+        # -------------------- Resume starting step --------------------
+        start_step = 0
+        resume_run = self.cfg.get("in_args", {}).get("resume_run", None)
+
+        if resume_run is not None:
+            # 1. Parse step from step_info.txt
+            step_info_file = os.path.join(resume_run, "step_info.txt")
+            if os.path.exists(step_info_file):
+                try:
+                    with open(step_info_file, "r") as f:
+                        for line in f:
+                            if "step" in line.lower():
+                                match = re.search(r"\d+", line)
+                                if match:
+                                    start_step = int(match.group(0))
+                                    break
+                except Exception as e:
+                    logging.warning(f"Could not parse step_info.txt: {e}")
+
+            # 2. Extract step from folder name: checkpoint-XXXXX
+            if start_step == 0:
+                match = re.search(r"checkpoint-(\d+)", str(resume_run))
+                if match:
+                    start_step = int(match.group(1))
+
+            # 3. Fallback to restored lr_scheduler state
+            if start_step == 0 and self.lr_scheduler is not None:
+                sched_step = getattr(self.lr_scheduler, "last_epoch", 0)
+                if sched_step > 0:
+                    start_step = int(sched_step)
+
+            if accelerator.is_main_process:
+                logging.info(f"Resuming training loop at global_step = {start_step}")
+
+        self.global_step = start_step
         self.max_global_step = self.cfg.optimization.max_iter
+
         # An eval/train round-trip before the loop lowers peak VAE memory.
         set_to_eval()
         set_to_train()
 
         for epoch in range(self.cfg.optimization.max_epoch):
             start_data_load = time()
-            # accumulator for logging the effective (averaged over micro-batches) loss
             running_weighted_loss = torch.tensor(0.0, device=accelerator.device)
             for step, batch in enumerate(self.train_loader):
                 if time() - start_data_load > 0.1:
                     print(
                         f"Data loading took more than 0.1s: {time() - start_data_load}s"
                     )
-                batch["out"] = {}  # outputs and intermediate results
+                batch["out"] = {}
                 with accelerator.accumulate(), accelerator.autocast():
                     self.network_graph["train"](batch)
 
@@ -339,7 +388,7 @@ class GenericTrainer:
                 batch["weighted_loss"] = 0
                 batch["global_step"] = self.global_step
                 self.loss_graph(batch)
-                # make sure we have a tensor on the accelerator device to accumulate
+
                 cur_loss = batch["weighted_loss"]
                 if not isinstance(cur_loss, torch.Tensor):
                     cur_loss = torch.as_tensor(
@@ -364,7 +413,9 @@ class GenericTrainer:
                     self.optimizer.zero_grad()
                     running_weighted_loss = torch.tensor(0.0, device=accelerator.device)
                     continue
+
                 accelerator.backward(loss)
+
                 # Optimization Step
                 if accelerator.sync_gradients:
                     self.global_step += 1
@@ -387,7 +438,6 @@ class GenericTrainer:
                         set_to_eval()
                         with AccelerateRandomContext(accelerator, seed=1234):
                             is_best_checkpoint = self.validate()
-                            # After each validation run, optionally visualize a few training samples
                             self.visualize_training_samples_after_validation()
                         if is_best_checkpoint:
                             save_path = os.path.join(
@@ -398,11 +448,17 @@ class GenericTrainer:
                                 save_step_info_txt(
                                     save_path, self.global_step, self.val_info
                                 )
+
                         save_path = os.path.join(
                             out_dir_run, "checkpoint", "checkpoint-latest"
                         )
                         accelerator.save_state(save_path)
+                        if is_main_process:
+                            save_step_info_txt(
+                                save_path, self.global_step, self.val_info
+                            )
                         set_to_train()
+
                     if do_ckpt:
                         set_to_eval()
                         save_path = os.path.join(
@@ -414,6 +470,7 @@ class GenericTrainer:
                                 save_path, self.global_step, self.val_info
                             )
                         set_to_train()
+
                     if do_visualization:
                         set_to_eval()
                         with AccelerateRandomContext(accelerator, seed=1234):
@@ -426,7 +483,6 @@ class GenericTrainer:
                             save_step_info_txt(
                                 save_path, self.global_step, self.val_info
                             )
-
                         set_to_train()
 
                     seen = set()
@@ -444,12 +500,8 @@ class GenericTrainer:
                             seen.add(pid)
                             params.append(p)
 
-                    # compute pre-clip gradient norm for logging
                     pre_grad_norm = self._compute_grad_norm(params)
-
                     accelerator.clip_grad_norm_(params, self.max_grad_norm)
-
-                    # compute post-clip gradient norm for logging
                     post_grad_norm = self._compute_grad_norm(params)
 
                     self.optimizer.step()
@@ -457,7 +509,6 @@ class GenericTrainer:
                     self.optimizer.zero_grad()
 
                     effective_loss = running_weighted_loss.detach()
-                    # reset accumulator for next optimizer step
                     running_weighted_loss = torch.tensor(0.0, device=accelerator.device)
 
                     logs = {
@@ -477,8 +528,6 @@ class GenericTrainer:
                         and accelerator.is_main_process
                     ):
                         print("The logs: ", logs)
-
-                        # Peak memory in MB (peak since last reset)
                         peak_mem = torch.cuda.max_memory_allocated() / (1024**2)
                         print(
                             f"Step {self.global_step}: Peak memory usage: {peak_mem:.2f} MB"
@@ -497,7 +546,7 @@ class GenericTrainer:
 
     def validate(self):
         ckpt_name = f"iter_{self.global_step:06d}"
-        main_metric_name = self.main_val_metric  # from cfg.validation
+        main_metric_name = self.main_val_metric
         per_dataset_scores = []
         self.val_info = {}
         for i, val_loader in enumerate(self.val_loaders):
@@ -508,13 +557,10 @@ class GenericTrainer:
             os.makedirs(vis_out_dir, exist_ok=True)
             REGISTRY["cfg"]["vis_out_dir"] = vis_out_dir
 
-            # Check if dataset has its own val_period and val_points
             dataset_cfg = val_loader.dataset.kwargs
             dataset_val_period = dataset_cfg.get("val_period", None)
             dataset_val_points = dataset_cfg.get("val_points", None)
-            # Use dataset-specific validation schedule if provided, otherwise use global
             if dataset_val_period is not None or dataset_val_points is not None:
-                # Dataset has its own validation schedule
                 should_run = False
                 if (
                     dataset_val_period is not None
@@ -546,14 +592,12 @@ class GenericTrainer:
                 )
             val_metric_dict = self._aggregate_metric_tracker(self.val_metrics)
 
-            # Print metric tracker results to console for immediate visibility
             if self.accelerator.is_main_process:
                 print(f"=== Metric Tracker Results for {val_dataset_name} ===")
                 for metric_name, metric_value in val_metric_dict.items():
                     print(f"  {metric_name}: {metric_value:.6f}")
                 print("=" * 50)
 
-            # Reset metric tracker for next dataset
             self.val_metrics.reset()
 
             if self.accelerator.is_main_process:
@@ -568,7 +612,6 @@ class GenericTrainer:
                 }
                 self.accelerator.log(scalars, step=self.global_step)
 
-            # save to file
             eval_text = eval_dict_to_text(
                 val_metrics=val_metric_dict,
                 dataset_name=val_dataset_name,
@@ -582,7 +625,6 @@ class GenericTrainer:
                 with open(_save_to, "w+") as f:
                     f.write(eval_text)
 
-            # collect value for main metric (if present)
             if main_metric_name in val_metric_dict:
                 per_dataset_scores.append(float(val_metric_dict[main_metric_name]))
             else:
@@ -593,7 +635,6 @@ class GenericTrainer:
 
             self.val_info[val_dataset_name] = val_metric_dict
 
-        # no valid scores -> nothing to compare
         if not per_dataset_scores:
             logging.warning(
                 f"No valid scores collected for main metric '{main_metric_name}' at step {self.global_step}."
@@ -602,11 +643,10 @@ class GenericTrainer:
 
         current_score = sum(per_dataset_scores) / len(per_dataset_scores)
 
-        # decide better based on goal
         if self.main_val_metric_goal == "minimize":
             is_best = current_score < self.best_val_score
             better_str = "<"
-        else:  # maximize
+        else:
             is_best = current_score > self.best_val_score
             better_str = ">"
 

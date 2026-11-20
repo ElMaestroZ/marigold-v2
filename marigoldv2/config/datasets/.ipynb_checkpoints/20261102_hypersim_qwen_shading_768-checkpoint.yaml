@@ -1,0 +1,173 @@
+hypersim_train_shading_qwen_768:
+  name: GenericDataset
+  disp_name: hypersim_train_shading_qwen_768
+  sampling_weight: 1.0
+  manifest_cfg:
+    name: GenericManifest
+    manifest_graph:
+      - LoadHypersimShadingManifest:
+          base_dir: ${oc.env:HYPERSIM_SHADING_DATASET_DIR,${oc.env:DEPTH_ASSETS_DIR,./assets}/datasets/marigold_train_shading}
+          split: train
+          source_split: train
+          selection: exclude_holdout
+          holdout_samples: 200
+          seed: 42
+          verify_files: true
+  transform:
+    - ReadRGBImage:
+        key: rgb_path
+        name: rgb
+        use_rel_dir: false
+        set_as_orig_res: true
+        save_orig: true
+    - ReadRGBShadingNpy:
+        key: shading_path
+        output_key: shading_gt
+        mask_key: valid_mask
+    - RandomHorizontalFlipShading:
+        p: 0.5
+        include_keys: [rgb_norm, rgb_int, shading_gt, valid_mask]
+    - ResizeRGBShading:
+        height: 576
+        width: 768
+        rgb_keys: [rgb_norm, rgb_int]
+        shading_key: shading_gt
+        mask_key: valid_mask
+
+hypersim_val_shading_qwen_768:
+  name: GenericDataset
+  disp_name: hypersim_val_shading_qwen_768
+  manifest_cfg:
+    name: GenericManifest
+    manifest_graph:
+      - LoadHypersimShadingManifest:
+          base_dir: ${oc.env:HYPERSIM_SHADING_DATASET_DIR,${oc.env:DEPTH_ASSETS_DIR,./assets}/datasets/marigold_train_shading}
+          split: val
+          source_split: train
+          selection: holdout
+          holdout_samples: 200
+          seed: 42
+          verify_files: true
+  transform:
+    - ReadRGBImage:
+        key: rgb_path
+        name: rgb
+        use_rel_dir: false
+        set_as_orig_res: true
+        save_orig: true
+    - ReadRGBShadingNpy:
+        key: shading_path
+        output_key: shading_gt
+        mask_key: valid_mask
+    - ResizeRGBShading:
+        height: 576
+        width: 768
+        rgb_keys: [rgb_norm, rgb_int]
+        shading_key: shading_gt
+        mask_key: valid_mask
+  validation_steps:
+    - RunInference: {}
+    - ComputeShadingMetrics:
+        pred_key: out/shading_pred
+        gt_key: shading_gt
+        mask_key: valid_mask
+
+hypersim_vis_shading_qwen_768:
+  name: GenericDataset
+  disp_name: hypersim_vis_shading_qwen_768
+  manifest_cfg:
+    name: GenericManifest
+    manifest_graph:
+      - LoadHypersimShadingManifest:
+          base_dir: ${oc.env:HYPERSIM_SHADING_DATASET_DIR,${oc.env:DEPTH_ASSETS_DIR,./assets}/datasets/marigold_train_shading}
+          split: vis
+          source_split: train
+          selection: holdout
+          holdout_samples: 200
+          max_samples: 8
+          seed: 42
+          verify_files: true
+  transform:
+    - ReadRGBImage:
+        key: rgb_path
+        name: rgb
+        use_rel_dir: false
+        set_as_orig_res: true
+        save_orig: true
+    - ReadRGBShadingNpy:
+        key: shading_path
+        output_key: shading_gt
+        mask_key: valid_mask
+    - ResizeRGBShading:
+        height: 576
+        width: 768
+        rgb_keys: [rgb_norm, rgb_int]
+        shading_key: shading_gt
+        mask_key: valid_mask
+  validation_steps:
+    - RunInference: {}
+    - VisualizeRGB:
+        batch_key: rgb_norm
+        folder_name: input_rgb
+        file_path_key: rgb_path
+        value_range: [-1, 1]
+    - VisualizeRGBShading:
+        batch_key: shading_gt
+        mask_key: valid_mask
+        folder_name: shading_gt
+        file_path_key: rgb_path
+    - VisualizeRGBShading:
+        batch_key: out/shading_pred
+        mask_key: valid_mask
+        folder_name: shading_prediction
+        file_path_key: rgb_path
+    - VisualizeShadingAbsoluteError:
+        pred_key: out/shading_pred
+        gt_key: shading_gt
+        mask_key: valid_mask
+        folder_name: shading_absolute_error
+        file_path_key: rgb_path
+        max_error: 1.0
+    - VisualizeShadingComparison:
+        rgb_key: rgb_norm
+        pred_key: out/shading_pred
+        gt_key: shading_gt
+        mask_key: valid_mask
+        folder_name: shading_comparison
+        file_path_key: rgb_path
+        max_error: 1.0
+
+hypersim_test_shading_qwen_768:
+  name: GenericDataset
+  disp_name: hypersim_test_shading_qwen_768
+  manifest_cfg:
+    name: GenericManifest
+    manifest_graph:
+      - LoadHypersimShadingManifest:
+          base_dir: ${oc.env:HYPERSIM_SHADING_DATASET_DIR,${oc.env:DEPTH_ASSETS_DIR,./assets}/datasets/marigold_train_shading}
+          split: test
+          source_split: test
+          verify_files: true
+  transform:
+    - ReadRGBImage:
+        key: rgb_path
+        name: rgb
+        use_rel_dir: false
+        set_as_orig_res: true
+        save_orig: true
+    - ReadRGBShadingNpy:
+        key: shading_path
+        output_key: shading_gt
+        mask_key: valid_mask
+    - ResizeRGBShading:
+        height: 576
+        width: 768
+        rgb_keys: [rgb_norm, rgb_int]
+        shading_key: shading_gt
+        mask_key: valid_mask
+  validation_steps:
+    - RunInference: {}
+    - ComputeShadingMetrics:
+        pred_key: out/shading_pred
+        gt_key: shading_gt
+        mask_key: valid_mask

@@ -44,6 +44,16 @@ MODALITIES = {
         "visualizer": "VisualizeFolderAlbedo",
         "visualization_folder": "visualizations/albedo",
     },
+    "shading": {
+        "checkpoint": REPO_ROOT / "output" / "train_runs" / "training_shading" / "checkpoint" / "checkpoint-best",
+        "embed_prefix": "qwen_edit_2509_qwen_albedo_rgb_dummy512",
+        "prediction_key": "out/shading_pred",
+        "adapter": "FolderRGBShadingPrediction",
+        "output_color_space": "srgb",
+        "visualizer": "VisualizeFolderShading",
+        "visualization_folder": "visualizations/shading",
+        
+    },
 }
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
