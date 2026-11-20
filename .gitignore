@@ -16,3 +16,5 @@ __pycache__/
 
 # tool caches
 .ruff_cache/
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
